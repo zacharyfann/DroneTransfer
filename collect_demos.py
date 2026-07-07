@@ -59,9 +59,6 @@ import cv2
 import numpy as np
 from stable_baselines3 import PPO
 
-from colosseum_nav_env import ColosseumNavEnv
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset shard writer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,11 +106,6 @@ class ShardWriter:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pos_from(info_goal: list, rel_goal: np.ndarray) -> np.ndarray:
-    """Absolute NED position = goal_world − relative_goal."""
-    return np.asarray(info_goal, dtype=np.float32) - rel_goal.astype(np.float32)
-
-
 def _resize_depth(depth: np.ndarray, size: int) -> np.ndarray:
     if depth.shape[:2] == (size, size):
         return depth.astype(np.float32)
@@ -136,6 +128,7 @@ def process_episode(
     stride: int,
     chunk_h: int,
     perception_size: int,
+    min_future_valid: int,
 ) -> None:
     """Apply hindsight relabelling to one episode and push samples to writer.
 
@@ -160,6 +153,11 @@ def process_episode(
             if idx < n:
                 future_offsets[k - 1] = positions[idx] - positions[t]
                 future_mask[k - 1] = 1
+        # Near episode end, many future waypoints are padded. For training a
+        # 3s planner this creates weak/noisy supervision, so optionally drop
+        # those samples here at collection time.
+        if int(future_mask.sum()) < min_future_valid:
+            continue
 
         # Action chunk targets (next H oracle commands)
         action_chunk = np.zeros((chunk_h, 3), dtype=np.float32)
@@ -206,26 +204,44 @@ def collect(args: argparse.Namespace) -> None:
 
     model = PPO.load(args.checkpoint.removesuffix(".zip"), device=args.device)
 
-    env = ColosseumNavEnv(
-        img_h=args.img_size,
-        img_w=args.img_size,
-        max_vel=5.0,
-        goal_radius=2.0,
-        max_steps=args.max_ep_steps,
-        step_duration=0.1,
-        smooth_coef=0.05,
-        action_smooth_alpha=0.6,
-        randomize_goal=True,
-        goal_min_dist=args.goal_min_dist,
-        goal_max_dist=args.goal_max_dist,
-        randomize_start=True,
-        start_radius=args.start_radius,
-        stuck_patience=7,
-        waypoints=waypoints,
-        include_image=True,                      # need the camera now
-        capture_perception=True,                 # depth + seg into info
-        perception_stride=args.perception_stride,  # only fetch images every N ticks
-    )
+    if args.sim_backend == "airsim":
+        from colosseum_nav_env import ColosseumNavEnv
+
+        env = ColosseumNavEnv(
+            img_h=args.img_size,
+            img_w=args.img_size,
+            max_vel=5.0,
+            goal_radius=2.0,
+            max_steps=args.max_ep_steps,
+            step_duration=0.1,
+            smooth_coef=0.05,
+            action_smooth_alpha=0.6,
+            randomize_goal=True,
+            goal_min_dist=args.goal_min_dist,
+            goal_max_dist=args.goal_max_dist,
+            randomize_start=True,
+            start_radius=args.start_radius,
+            stuck_patience=7,
+            waypoints=waypoints,
+            include_image=True,                      # need the camera now
+            capture_perception=True,                 # depth + seg into info
+            perception_stride=args.perception_stride,  # only fetch images every N ticks
+        )
+    else:
+        if not args.isaac_task:
+            raise ValueError("--isaac-task is required when --sim-backend isaac")
+        from isaac_nav_env import IsaacNavEnv
+
+        env = IsaacNavEnv(
+            task_id=args.isaac_task,
+            img_h=args.img_size,
+            img_w=args.img_size,
+            max_vel=5.0,
+            goal_radius=2.0,
+            max_steps=args.max_ep_steps,
+            headless=(not args.isaac_vis),
+            include_image=True,
+        )
 
     writer = ShardWriter(args.out, args.shard_size)
     rng_seed = args.seed
@@ -247,19 +263,38 @@ def collect(args: argparse.Namespace) -> None:
             action = np.asarray(action, dtype=np.float32)
 
             t = len(positions)
-            positions.append(_pos_from(info["goal"], rel_goal))
+            if "position" in info:
+                pos_now = np.asarray(info["position"], dtype=np.float32).reshape(-1)[:3]
+            elif args.sim_backend == "airsim" and "goal" in info:
+                pos_now = np.asarray(info["goal"], dtype=np.float32) - rel_goal
+            elif positions:
+                pos_now = positions[-1] + vel * 0.1
+            else:
+                pos_now = np.zeros(3, dtype=np.float32)
+            positions.append(pos_now.astype(np.float32))
             actions.append(action)
 
             # "depth" is only present in info on a perception-capture tick
             # (see ColosseumNavEnv.perception_stride) — cheap on every other tick.
-            if "depth" in info:
+            capture_tick = ("depth" in info) or (
+                args.sim_backend == "isaac" and (t % args.perception_stride == 0)
+            )
+            if capture_tick:
+                depth = info.get(
+                    "depth",
+                    np.zeros((args.perception_size, args.perception_size), dtype=np.float32),
+                )
+                seg = info.get(
+                    "seg",
+                    np.zeros((args.perception_size, args.perception_size, 3), dtype=np.uint8),
+                )
                 decisions.append({
                     "t":     t,
                     "image": obs["image"].astype(np.uint8),
                     "goal":  rel_goal,
                     "vel":   vel,
-                    "depth": info["depth"],
-                    "seg":   info["seg"],
+                    "depth": depth,
+                    "seg":   seg,
                 })
 
             obs, _reward, terminated, truncated, info = env.step(action)
@@ -274,6 +309,7 @@ def collect(args: argparse.Namespace) -> None:
             stride=args.stride,
             chunk_h=args.chunk_h,
             perception_size=args.perception_size,
+            min_future_valid=args.min_future_valid,
         )
         episodes += 1
         print(f"episode {episodes:4d}  len={len(positions):4d}  "
@@ -292,6 +328,7 @@ def collect(args: argparse.Namespace) -> None:
         "perception_stride": args.perception_stride,
         "horizon_k": args.horizon_k,
         "stride": args.stride,
+        "min_future_valid": args.min_future_valid,
         "horizon_seconds": args.horizon_k * args.stride * 0.1,
         "chunk_h": args.chunk_h,
         "control_hz": 10,
@@ -311,6 +348,9 @@ def collect(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect oracle demos for the dual-system pipeline")
+    parser.add_argument("--sim-backend", choices=["airsim", "isaac"], default="airsim")
+    parser.add_argument("--isaac-task", type=str, default=None)
+    parser.add_argument("--isaac-vis", action="store_true")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to a trained oracle PPO .zip checkpoint")
     parser.add_argument("--steps", type=int, default=20_000,
@@ -338,6 +378,10 @@ if __name__ == "__main__":
                         help="Number of future trajectory waypoints")
     parser.add_argument("--stride", type=int, default=5,
                         help="Steps between trajectory waypoints (5 = 0.5s @ 10Hz)")
+    parser.add_argument("--min-future-valid", type=int, default=4,
+                        help="Minimum valid future waypoints required to keep a sample "
+                             "(default 4). Drops near-episode-end samples with mostly "
+                             "padded trajectory labels.")
     parser.add_argument("--chunk-h", type=int, default=16,
                         help="Action-chunk length for System 1")
     parser.add_argument("--shard-size", type=int, default=2000,

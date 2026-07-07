@@ -20,6 +20,8 @@ Usage:
   python train_ppo.py                          # oracle mode, 200k steps
   python train_ppo.py --mode vision            # CNN policy
   python train_ppo.py --mode vlm               # frozen SigLIP + MLP
+  python train_ppo.py --sim-backend isaac --isaac-task Isaac-Quadcopter-Direct-v0 \
+      --mode oracle --num-envs 8 --steps 100000 --isaac-vis
   python train_ppo.py --mode oracle --steps 500000 --goal 30 0 -15
   python train_ppo.py --mode oracle --steps 100000 --checkpoint checkpoints/oracle/ppo_oracle_30000_steps
 
@@ -58,9 +60,6 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv
-
-from colosseum_nav_env import ColosseumNavEnv
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0. Episode stats callback  (success / collision / timeout rates → TensorBoard)
@@ -129,7 +128,7 @@ class EpisodeStatsCallback(BaseCallback):
 class OracleNavWrapper(gym.ObservationWrapper):
     """Drops the image; exposes only goal + velocity as a flat vector."""
 
-    def __init__(self, env: ColosseumNavEnv) -> None:
+    def __init__(self, env: gym.Env) -> None:
         super().__init__(env)
         self.observation_space = gym.spaces.Box(
             low=-500.0, high=500.0,
@@ -148,7 +147,7 @@ class OracleNavWrapper(gym.ObservationWrapper):
 class ImageNavWrapper(gym.ObservationWrapper):
     """Returns only the image (H, W, 3) for CnnPolicy."""
 
-    def __init__(self, env: ColosseumNavEnv) -> None:
+    def __init__(self, env: gym.Env) -> None:
         super().__init__(env)
         self.observation_space = env.observation_space["image"]
 
@@ -234,6 +233,7 @@ class FrozenSigLIPExtractor(BaseFeaturesExtractor):
 
 def make_env(
     mode: str,
+    sim_backend: str,
     goal: tuple[float, float, float],
     max_steps: int,
     smooth_coef: float = 0.0,
@@ -248,29 +248,49 @@ def make_env(
     stuck_patience: int = 10,
     stuck_pen: float = -20.0,
     waypoints: list | None = None,
+    isaac_task: str | None = None,
+    isaac_headless: bool = True,
 ) -> gym.Env:
-    base = ColosseumNavEnv(
-        goal=goal,
-        img_h=84,
-        img_w=84,
-        max_vel=5.0,
-        goal_radius=2.0,
-        max_steps=max_steps,
-        step_duration=0.1,
-        smooth_coef=smooth_coef,
-        action_smooth_alpha=action_smooth_alpha,
-        randomize_goal=randomize_goal,
-        goal_min_dist=goal_min_dist,
-        goal_max_dist=goal_max_dist,
-        goal_alt_min=goal_alt_min,
-        goal_alt_max=goal_alt_max,
-        randomize_start=randomize_start,
-        start_radius=start_radius,
-        stuck_patience=stuck_patience,
-        stuck_pen=stuck_pen,
-        waypoints=waypoints,
-        include_image=(mode != "oracle"),  # skip camera RPC in oracle mode
-    )
+    if sim_backend == "airsim":
+        from colosseum_nav_env import ColosseumNavEnv
+
+        base = ColosseumNavEnv(
+            goal=goal,
+            img_h=84,
+            img_w=84,
+            max_vel=5.0,
+            goal_radius=2.0,
+            max_steps=max_steps,
+            step_duration=0.1,
+            smooth_coef=smooth_coef,
+            action_smooth_alpha=action_smooth_alpha,
+            randomize_goal=randomize_goal,
+            goal_min_dist=goal_min_dist,
+            goal_max_dist=goal_max_dist,
+            goal_alt_min=goal_alt_min,
+            goal_alt_max=goal_alt_max,
+            randomize_start=randomize_start,
+            start_radius=start_radius,
+            stuck_patience=stuck_patience,
+            stuck_pen=stuck_pen,
+            waypoints=waypoints,
+            include_image=(mode != "oracle"),  # skip camera RPC in oracle mode
+        )
+    else:
+        if not isaac_task:
+            raise ValueError("--isaac-task is required when --sim-backend isaac")
+        from isaac_nav_env import IsaacNavEnv
+
+        base = IsaacNavEnv(
+            task_id=isaac_task,
+            img_h=84,
+            img_w=84,
+            max_vel=5.0,
+            goal_radius=2.0,
+            max_steps=max_steps,
+            headless=isaac_headless,
+            include_image=(mode != "oracle"),
+        )
     if mode == "oracle":
         env = OracleNavWrapper(base)
     elif mode == "vision":
@@ -278,6 +298,45 @@ def make_env(
     else:   # vlm
         env = base  # full Dict obs — extractor handles decomposition
     return Monitor(env)
+
+
+def make_isaac_sb3_env(args: argparse.Namespace, mode: str) -> Any:
+    """Create a GPU-vectorized Isaac Lab env for SB3 (many parallel sim instances)."""
+    if mode in ("vision", "vlm"):
+        raise NotImplementedError(
+            "Isaac multi-env GPU training currently supports --mode oracle only. "
+            "Use --sim-backend airsim for vision/vlm, or keep --num-envs 1 with IsaacNavEnv."
+        )
+    if not args.isaac_task:
+        raise ValueError("--isaac-task is required when --sim-backend isaac")
+    if args.isaac_vis and args.num_envs > 16:
+        print(
+            "[WARN] --isaac-vis with many envs is very heavy for livestream. "
+            "Consider --num-envs 4-16 for smoother WebRTC."
+        )
+
+    from isaac_nav_env import _ensure_isaac_lab, _make_isaac_task
+
+    try:
+        _ensure_isaac_lab(
+            headless=True,
+            livestream=2 if args.isaac_vis else -1,
+            enable_cameras=bool(args.isaac_vis),
+        )
+    except TypeError:
+        # Server copy of isaac_nav_env.py not synced yet (no livestream kwarg)
+        _ensure_isaac_lab(headless=not args.isaac_vis)
+
+    # Must import after AppLauncher — isaaclab pulls in pxr (USD).
+    from isaaclab_rl.sb3 import Sb3VecEnvWrapper
+
+    base = _make_isaac_task(
+        args.isaac_task,
+        num_envs=args.num_envs,
+        device=args.sim_device,
+        visual_friendly=bool(args.isaac_vis),
+    )
+    return Sb3VecEnvWrapper(base, fast_variant=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,8 +403,9 @@ def build_ppo(
 
 def train(args: argparse.Namespace) -> None:
     goal = tuple(args.goal)
-    log_dir = os.path.join("logs", args.mode)
-    ckpt_dir = os.path.join("checkpoints", args.mode)
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(root_dir, "logs", args.mode)
+    ckpt_dir = os.path.join(root_dir, "checkpoints", args.mode)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -356,6 +416,9 @@ def train(args: argparse.Namespace) -> None:
         print(f"Waypoints    : {len(waypoints)} loaded from {args.waypoints_file}")
 
     print(f"\nMode         : {args.mode}")
+    print(f"Sim backend  : {args.sim_backend}")
+    if args.sim_backend == "isaac":
+        print(f"Isaac task   : {args.isaac_task}")
     if args.randomize_goal:
         print(f"Goal         : RANDOM  h=[{args.goal_min_dist}, {args.goal_max_dist}]m  "
               f"alt=[{args.goal_alt_min}, {args.goal_alt_max}]m")
@@ -367,30 +430,43 @@ def train(args: argparse.Namespace) -> None:
         print(f"Start        : fixed spawn")
     print(f"Smooth coef  : {args.smooth_coef}  (EMA alpha={args.action_smooth_alpha})")
     print(f"Steps        : {args.steps:,}")
+    print(f"Log dir      : {log_dir}")
+    print(f"Checkpoint dir: {ckpt_dir}")
+    if args.sim_backend == "isaac":
+        print(f"Num envs     : {args.num_envs}  (parallel GPU sim instances)")
+        print(f"Sim device   : {args.sim_device}")
     device = args.device
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    if device == "cpu" and torch.cuda.is_available():
-        print("  (pass --device cuda to use the GPU for the policy network)")
+        if args.sim_backend == "isaac" and args.mode == "oracle":
+            device = "cpu"  # tiny MLP on CPU; GPU reserved for Isaac Sim
+        else:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Policy device: {device}")
+    if args.sim_backend == "isaac" and args.mode == "oracle":
+        print("  (Isaac Sim uses GPU via --sim-device; oracle MLP stays on CPU for efficiency)")
     print()
 
     _wps = waypoints  # capture for lambda closure
-    env = DummyVecEnv([lambda: make_env(
-        args.mode, goal, args.max_ep_steps,
-        smooth_coef=args.smooth_coef,
-        action_smooth_alpha=args.action_smooth_alpha,
-        randomize_goal=args.randomize_goal,
-        goal_min_dist=args.goal_min_dist,
-        goal_max_dist=args.goal_max_dist,
-        goal_alt_min=args.goal_alt_min,
-        goal_alt_max=args.goal_alt_max,
-        randomize_start=args.randomize_start,
-        start_radius=args.start_radius,
-        stuck_patience=args.stuck_patience,
-        stuck_pen=args.stuck_pen,
-        waypoints=_wps,
-    )])
+    if args.sim_backend == "isaac":
+        env = make_isaac_sb3_env(args, args.mode)
+    else:
+        env = DummyVecEnv([lambda: make_env(
+            args.mode, args.sim_backend, goal, args.max_ep_steps,
+            smooth_coef=args.smooth_coef,
+            action_smooth_alpha=args.action_smooth_alpha,
+            randomize_goal=args.randomize_goal,
+            goal_min_dist=args.goal_min_dist,
+            goal_max_dist=args.goal_max_dist,
+            goal_alt_min=args.goal_alt_min,
+            goal_alt_max=args.goal_alt_max,
+            randomize_start=args.randomize_start,
+            start_radius=args.start_radius,
+            stuck_patience=args.stuck_patience,
+            stuck_pen=args.stuck_pen,
+            waypoints=_wps,
+            isaac_task=args.isaac_task,
+            isaac_headless=(not args.isaac_vis),
+        )])
 
     if args.checkpoint:
         ckpt_path = args.checkpoint.removesuffix(".zip")
@@ -445,6 +521,27 @@ def train(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO on ColosseumNavEnv")
+    parser.add_argument(
+        "--sim-backend", choices=["airsim", "isaac"], default="airsim",
+        help="Simulation backend: airsim (legacy Colosseum) or isaac (Isaac Sim/Lab)",
+    )
+    parser.add_argument(
+        "--isaac-task", type=str, default=None,
+        help="Gym task id for Isaac backend (example: Isaac-Aerial-Quadcopter-Direct-v0)",
+    )
+    parser.add_argument(
+        "--isaac-vis", action="store_true",
+        help="Run Isaac task with GUI (headless disabled)",
+    )
+    parser.add_argument(
+        "--num-envs", type=int, default=512,
+        help="Isaac Lab only: parallel env instances on GPU (default 512). "
+             "Ignored for airsim backend.",
+    )
+    parser.add_argument(
+        "--sim-device", type=str, default="cuda:0",
+        help="Isaac Lab only: GPU used by the simulator (default cuda:0)",
+    )
     parser.add_argument(
         "--mode", choices=["oracle", "vision", "vlm"], default="oracle",
         help="oracle=pose-only, vision=CNN, vlm=frozen SigLIP",

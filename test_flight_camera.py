@@ -1,22 +1,41 @@
-import airsim
+import argparse
 import numpy as np
 import cv2
 
-client = airsim.MultirotorClient()
-client.confirmConnection()
-client.enableApiControl(True)
-client.armDisarm(True)
-client.takeoffAsync().join()
-client.moveToPositionAsync(10, 0, -10, 5).join()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Capture one RGB frame from backend env")
+    parser.add_argument("--sim-backend", choices=["airsim", "isaac"], default="airsim")
+    parser.add_argument("--isaac-task", type=str, default=None)
+    parser.add_argument("--isaac-vis", action="store_true")
+    parser.add_argument("--out", type=str, default="camera_test.png")
+    args = parser.parse_args()
 
-responses = client.simGetImages([
-    airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
-])
-img = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)
-img = img.reshape(responses[0].height, responses[0].width, 3)
-cv2.imwrite(r"c:\DroneProject\camera_test.png", img)
-print("Saved c:\\DroneProject\\camera_test.png", img.shape)
+    if args.sim_backend == "airsim":
+        from colosseum_nav_env import ColosseumNavEnv
 
-client.landAsync().join()
-client.armDisarm(False)
-client.enableApiControl(False)
+        env = ColosseumNavEnv(include_image=True)
+    else:
+        if not args.isaac_task:
+            raise ValueError("--isaac-task is required when --sim-backend isaac")
+        from isaac_nav_env import IsaacNavEnv
+
+        env = IsaacNavEnv(
+            task_id=args.isaac_task,
+            include_image=True,
+            headless=(not args.isaac_vis),
+        )
+
+    obs, _info = env.reset()
+    obs, _reward, terminated, truncated, _info = env.step(
+        np.array([0.5, 0.0, 0.0], dtype=np.float32)
+    )
+    if terminated or truncated:
+        obs, _info = env.reset()
+    img = obs["image"]
+    cv2.imwrite(args.out, img)
+    print(f"Saved {args.out}", img.shape)
+    env.close()
+
+
+if __name__ == "__main__":
+    main()

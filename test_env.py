@@ -16,24 +16,43 @@ import time
 
 import numpy as np
 
-from colosseum_nav_env import ColosseumNavEnv
-
 
 def run_smoke_test(
     n_episodes: int = 2,
     max_steps_per_ep: int = 30,
     goal: tuple = (20.0, 0.0, -10.0),
+    sim_backend: str = "airsim",
+    isaac_task: str | None = None,
+    isaac_headless: bool = True,
     verbose: bool = True,
 ) -> None:
-    env = ColosseumNavEnv(
-        goal=goal,
-        img_h=84,
-        img_w=84,
-        max_vel=3.0,
-        goal_radius=2.0,
-        max_steps=max_steps_per_ep,
-        step_duration=0.1,
-    )
+    if sim_backend == "airsim":
+        from colosseum_nav_env import ColosseumNavEnv
+
+        env = ColosseumNavEnv(
+            goal=goal,
+            img_h=84,
+            img_w=84,
+            max_vel=3.0,
+            goal_radius=2.0,
+            max_steps=max_steps_per_ep,
+            step_duration=0.1,
+        )
+    else:
+        if not isaac_task:
+            raise ValueError("--isaac-task is required when --sim-backend isaac")
+        from isaac_nav_env import IsaacNavEnv
+
+        env = IsaacNavEnv(
+            task_id=isaac_task,
+            img_h=84,
+            img_w=84,
+            max_vel=3.0,
+            goal_radius=2.0,
+            max_steps=max_steps_per_ep,
+            headless=isaac_headless,
+            include_image=True,
+        )
 
     print(f"\nObservation space:\n{env.observation_space}")
     print(f"Action space:      {env.action_space}\n")
@@ -82,6 +101,9 @@ def run_smoke_test(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Smoke-test ColosseumNavEnv")
+    parser.add_argument("--sim-backend", choices=["airsim", "isaac"], default="airsim")
+    parser.add_argument("--isaac-task", type=str, default=None)
+    parser.add_argument("--isaac-vis", action="store_true")
     parser.add_argument("--episodes", type=int, default=2)
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--goal", nargs=3, type=float,
@@ -94,5 +116,8 @@ if __name__ == "__main__":
         n_episodes=args.episodes,
         max_steps_per_ep=args.steps,
         goal=tuple(args.goal),
+        sim_backend=args.sim_backend,
+        isaac_task=args.isaac_task,
+        isaac_headless=(not args.isaac_vis),
         verbose=not args.quiet,
     )
